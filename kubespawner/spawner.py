@@ -1633,6 +1633,17 @@ class KubeSpawner(Spawner):
         # track by order and name instead of uid
         # so we get events like deletion of a previously stale
         # pod if it's part of this spawn process
+         # modify by xiazhenghai @2018-12-28 for options参数无法生效的问题 begin
+        options = self.user_options
+        kubespawner_override = options.get('kubespawner_override', {})
+        for k, v in kubespawner_override.items():
+            if callable(v):
+                v = v(self)
+                self.log.debug(".. overriding KubeSpawner value %s=%s (callable result)", k, v)
+            else:
+                self.log.debug(".. overriding KubeSpawner value %s=%s", k, v)
+            setattr(self, k, v)
+         # modify by xiazhenghai @2018-12-28 for options参数无法生效的问题 end
         events = self.events
         if events:
             self._last_event = events[-1].metadata.uid
