@@ -16,6 +16,7 @@ import warnings
 from tornado import gen
 from tornado.ioloop import IOLoop
 from tornado.concurrent import run_on_executor
+from tornado import web
 from traitlets import (
     Bool,
     Dict,
@@ -447,6 +448,7 @@ class KubeSpawner(Spawner):
             Integer(),
             Callable(),
         ],
+        allow_none=True,
         config=True,
         help="""
         The UID to run the single-user server containers as.
@@ -471,6 +473,7 @@ class KubeSpawner(Spawner):
             Integer(),
             Callable(),
         ],
+        allow_none=True,
         config=True,
         help="""
         The GID to run the single-user server containers as.
@@ -495,6 +498,7 @@ class KubeSpawner(Spawner):
             Integer(),
             Callable(),
         ],
+        allow_none=True,
         config=True,
         help="""
         The GID of the group that should own any volumes that are created & mounted.
@@ -1103,6 +1107,21 @@ class KubeSpawner(Spawner):
         """
     )
 
+    delete_grace_period = Integer(
+        1,
+        config=True,
+        help="""
+        Time in seconds for the pod to be in `terminating` state before is forcefully killed.
+        
+        Increase this if you need more time to execute a `preStop` lifecycle hook.
+
+        See https://kubernetes.io/docs/concepts/workloads/pods/pod/#termination-of-pods for
+        more information on how pod termination works.
+
+        Defaults to `1`.
+        """
+    )
+
     # deprecate redundant and inconsistent singleuser_ and user_ prefixes:
     _deprecated_traits_09 = [
         "singleuser_working_dir",
@@ -1228,7 +1247,7 @@ class KubeSpawner(Spawner):
         # Set servername based on whether named-server initialised
         if self.name:
             servername = '-{}'.format(self.name)
-            safe_servername = escapism.escape(servername, safe=safe_chars, escape_char='-').lower()
+            safe_servername = '-{}'.format(escapism.escape(self.name, safe=safe_chars, escape_char='-').lower())
         else:
             servername = ''
             safe_servername = ''
@@ -1628,6 +1647,10 @@ class KubeSpawner(Spawner):
     @gen.coroutine
     def _start(self):
         """Start the user's pod"""
+
+        # load user options (including profile)
+        yield self.load_user_options()
+
         # record latest event so we don't include old
         # events from previous pods in self.events
         # track by order and name instead of uid
@@ -1761,9 +1784,7 @@ class KubeSpawner(Spawner):
         if now:
             grace_seconds = 0
         else:
-            # Give it some time, but not the default (which is 30s!)
-            # FIXME: Move this into pod creation maybe?
-            grace_seconds = 1
+            grace_seconds = self.delete_grace_period
 
         delete_options.grace_period_seconds = grace_seconds
         self.log.info("Deleting pod %s", self.pod_name)
@@ -1798,6 +1819,8 @@ class KubeSpawner(Spawner):
     def _env_keep_default(self):
         return []
 
+    _profile_list = None
+
     def _render_options_form(self, profile_list):
         self._profile_list = profile_list
         profile_form_template = Environment(loader=BaseLoader).from_string(self.profile_form_template)
@@ -1827,8 +1850,9 @@ class KubeSpawner(Spawner):
     def options_from_form(self, formdata):
         """get the option selected by the user on the form
 
-        It actually reset the settings of kubespawner to each item found in the selected profile
-        (`kubespawner_override`).
+        This only constructs the user_options dict,
+        it should not actually load any options.
+        That is done later in `.load_user_options()`
 
         Args:
             formdata: user selection returned by the form
@@ -1844,15 +1868,49 @@ class KubeSpawner(Spawner):
             </select>
 
         Returns:
-            the selected user option
+            user_options (dict): the selected profile in the user_options form,
+                e.g. ``{"profile": "8 CPUs"}``
         """
-        if not self.profile_list or not hasattr(self, '_profile_list'):
+        if not self.profile_list or self._profile_list is None:
             return formdata
         # Default to first profile if somehow none is provided
-        selected_profile = int(formdata.get('profile', [0])[0])
-        options = self._profile_list[selected_profile]
-        self.log.debug("Applying KubeSpawner override for profile '%s'", options['display_name'])
-        kubespawner_override = options.get('kubespawner_override', {})
+        try:
+            selected_profile = int(formdata.get('profile', [0])[0])
+            options = self._profile_list[selected_profile]
+        except (TypeError, IndexError, ValueError):
+            raise web.HTTPError(400, "No such profile: %i", formdata.get('profile', None))
+        return {
+            'profile': options['display_name']
+        }
+
+    @gen.coroutine
+    def _load_profile(self, profile_name):
+        """Load a profile by name
+
+        Called by load_user_options
+        """
+
+        # find the profile
+        default_profile = self._profile_list[0]
+        for profile in self._profile_list:
+            if profile.get('default', False):
+                # explicit default, not the first
+                default_profile = profile
+
+            if profile['display_name'] == profile_name:
+                break
+        else:
+            if profile_name:
+                # name specified, but not found
+                raise ValueError("No such profile: %s. Options include: %s" % (
+                    profile_name, ', '.join(p['display_name'] for p in self._profile_list)
+                ))
+            else:
+                # no name specified, use the default
+                profile = default_profile
+
+        self.log.debug("Applying KubeSpawner override for profile '%s'", profile['display_name'])
+        kubespawner_override = profile.get('kubespawner_override', {})
         for k, v in kubespawner_override.items():
             if callable(v):
                 v = v(self)
@@ -1860,4 +1918,20 @@ class KubeSpawner(Spawner):
             else:
                 self.log.debug(".. overriding KubeSpawner value %s=%s", k, v)
             setattr(self, k, v)
-        return options
+
+    @gen.coroutine
+    def load_user_options(self):
+        """Load user options from self.user_options dict
+
+        This can be set via POST to the API or via options_from_form
+
+        Only supported argument by default is 'profile'.
+        Override in subclasses to support other options.
+        """
+        if self._profile_list is None:
+            if callable(self.profile_list):
+                self._profile_list = yield gen.maybe_future(self.profile_list(self))
+            else:
+                self._profile_list = self.profile_list
+        if self._profile_list:
+            yield self._load_profile(self.user_options.get('profile', None))

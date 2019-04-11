@@ -2,10 +2,9 @@
 Helper methods for generating k8s API objects.
 """
 import json
-from urllib.parse import urlparse
-import escapism
 import re
-import string
+from urllib.parse import urlparse
+
 from kubespawner.utils import get_k8s_model, update_k8s_model
 
 from kubernetes.client.models import (
@@ -17,9 +16,6 @@ from kubernetes.client.models import (
     V1PersistentVolumeClaim, V1PersistentVolumeClaimSpec,
     V1Endpoints, V1EndpointSubset, V1EndpointAddress, V1EndpointPort,
     V1Service, V1ServiceSpec, V1ServicePort,
-    V1beta1Ingress, V1beta1IngressSpec, V1beta1IngressRule,
-    V1beta1HTTPIngressRuleValue, V1beta1HTTPIngressPath,
-    V1beta1IngressBackend,
     V1Toleration,
     V1Affinity,
     V1NodeAffinity, V1NodeSelector, V1NodeSelectorTerm, V1PreferredSchedulingTerm, V1NodeSelectorRequirement,
@@ -99,6 +95,10 @@ def make_pod(
     run_as_gid:
         The GID used to run single-user pods. The default is to run as the primary
         group of the user specified in the Dockerfile, if this is set to None.
+        Setting this parameter requires that *feature-gate* **RunAsGroup** be enabled,
+        otherwise the effective GID of the pod will be 0 (root).  In addition, not
+        setting `run_as_gid` once feature-gate RunAsGroup is enabled will also
+        result in an effective GID of 0 (root).
     fs_gid
         The gid that will own any fresh volumes mounted into this pod, if using
         volume types that support this (such as GCE). This should be a group that
@@ -441,6 +441,16 @@ def make_ingress(
     """
     Returns an ingress, service, endpoint object that'll work for this service
     """
+
+    # move beta imports here,
+    # which are more sensitive to kubernetes version
+    # and will change when they move out of beta
+    from kubernetes.client.models import (
+        V1beta1Ingress, V1beta1IngressSpec, V1beta1IngressRule,
+        V1beta1HTTPIngressRuleValue, V1beta1HTTPIngressPath,
+        V1beta1IngressBackend,
+    )
+
     meta = V1ObjectMeta(
         name=name,
         annotations={

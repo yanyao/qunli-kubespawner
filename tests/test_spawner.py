@@ -1,6 +1,7 @@
 from unittest.mock import Mock
 
 from jupyterhub.objects import Hub, Server
+from jupyterhub.orm import Spawner
 import pytest
 from traitlets.config import Config
 from asyncio import get_event_loop
@@ -18,6 +19,10 @@ def sync_wait(future):
 class MockUser(Mock):
     name = 'fake'
     server = Server()
+
+    @property
+    def escaped_name(self):
+        return self.name
 
     @property
     def url(self):
@@ -59,6 +64,35 @@ def test_deprecated_runtime_access():
     spawner.image = 'abc:123'
     assert spawner.image_spec == 'abc:123'
     assert spawner.image == 'abc:123'
+
+
+def test_spawner_values():
+    """Spawner values are set correctly"""
+    spawner = KubeSpawner(_mock=True)
+
+    def set_id(spawner):
+        return 1
+
+    spawner.uid = 10
+    assert spawner.uid == 10
+    spawner.uid = set_id
+    assert spawner.uid == set_id
+    spawner.uid = None
+    assert spawner.uid == None
+
+    spawner.gid = 20
+    assert spawner.gid == 20
+    spawner.gid = set_id
+    assert spawner.gid == set_id
+    spawner.gid = None
+    assert spawner.gid == None
+
+    spawner.fs_gid = 30
+    assert spawner.fs_gid == 30
+    spawner.fs_gid = set_id
+    assert spawner.fs_gid == set_id
+    spawner.fs_gid = None
+    assert spawner.fs_gid == None
 
 
 @pytest.mark.asyncio
@@ -148,3 +182,125 @@ def test_get_pod_manifest_tolerates_mixed_input():
     assert isinstance(manifest, V1Pod)
     assert isinstance(manifest.spec.init_containers[0], V1Container)
     assert isinstance(manifest.spec.init_containers[1], V1Container)
+
+
+_test_profiles = [
+    {
+        'display_name': 'Training Env - Python',
+        'default': True,
+        'kubespawner_override': {
+            'image': 'training/python:label',
+            'cpu_limit': 1,
+            'mem_limit': 512 * 1024 * 1024,
+            }
+    },
+    {
+        'display_name': 'Training Env - Datascience',
+        'kubespawner_override': {
+            'image': 'training/datascience:label',
+            'cpu_limit': 4,
+            'mem_limit': 8 * 1024 * 1024 * 1024,
+            }
+    },
+]
+
+
+@pytest.mark.asyncio
+async def test_user_options_set_from_form():
+    spawner = KubeSpawner(_mock=True)
+    spawner.profile_list = _test_profiles
+    # render the form
+    await spawner.get_options_form()
+    spawner.user_options = spawner.options_from_form({'profile': [1]})
+    assert spawner.user_options == {
+        'profile': _test_profiles[1]['display_name'],
+    }
+    # nothing should be loaded yet
+    assert spawner.cpu_limit is None
+    await spawner.load_user_options()
+    for key, value in _test_profiles[1]['kubespawner_override'].items():
+        assert getattr(spawner, key) == value
+
+
+@pytest.mark.asyncio
+async def test_user_options_api():
+    spawner = KubeSpawner(_mock=True)
+    spawner.profile_list = _test_profiles
+    # set user_options directly (e.g. via api)
+    spawner.user_options = {'profile': _test_profiles[1]['display_name']}
+
+    # nothing should be loaded yet
+    assert spawner.cpu_limit is None
+    await spawner.load_user_options()
+    for key, value in _test_profiles[1]['kubespawner_override'].items():
+        assert getattr(spawner, key) == value
+
+
+@pytest.mark.asyncio
+async def test_default_profile():
+    spawner = KubeSpawner(_mock=True)
+    spawner.profile_list = _test_profiles
+    spawner.user_options = {}
+    # nothing should be loaded yet
+    assert spawner.cpu_limit is None
+    await spawner.load_user_options()
+    for key, value in _test_profiles[0]['kubespawner_override'].items():
+        assert getattr(spawner, key) == value
+
+
+def test_pod_name_no_named_servers():
+    c = Config()
+    c.JupyterHub.allow_named_servers = False
+
+    user = Config()
+    user.name = "user"
+
+    orm_spawner = Spawner()
+
+    spawner = KubeSpawner(config=c, user=user, orm_spawner=orm_spawner, _mock=True)
+
+    assert spawner.pod_name == "jupyter-user"
+
+
+def test_pod_name_named_servers():
+    c = Config()
+    c.JupyterHub.allow_named_servers = True
+
+    user = Config()
+    user.name = "user"
+
+    orm_spawner = Spawner()
+    orm_spawner.name = "server"
+
+    spawner = KubeSpawner(config=c, user=user, orm_spawner=orm_spawner, _mock=True)
+
+    assert spawner.pod_name == "jupyter-user-server"
+
+
+def test_pod_name_escaping():
+    c = Config()
+    c.JupyterHub.allow_named_servers = True
+
+    user = Config()
+    user.name = "some_user"
+
+    orm_spawner = Spawner()
+    orm_spawner.name = "test-server!"
+
+    spawner = KubeSpawner(config=c, user=user, orm_spawner=orm_spawner, _mock=True)
+
+    assert spawner.pod_name == "jupyter-some-5fuser-test-2dserver-21"
+
+
+def test_pod_name_custom_template():
+    c = Config()
+    c.JupyterHub.allow_named_servers = False
+
+    user = Config()
+    user.name = "some_user"
+
+    pod_name_template = "prefix-{username}-suffix"
+
+    spawner = KubeSpawner(config=c, user=user, pod_name_template=pod_name_template, _mock=True)
+
+    assert spawner.pod_name == "prefix-some-5fuser-suffix"
